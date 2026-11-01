@@ -1,6 +1,7 @@
 import argparse
 import logging
 import requests
+import sys
 from urllib.parse import urlparse, urljoin
 
 # Configure logging
@@ -20,34 +21,82 @@ def is_valid_url(url):
         return False
 
 
+def parsed_origin(url):
+    """Returns (scheme, host, effective port) for a URL, or None if unparsable."""
+    try:
+        parts = urlparse(url)
+        if not parts.scheme or not parts.hostname:
+            return None
+        port = parts.port
+        if port is None:
+            port = 443 if parts.scheme == "https" else 80
+        return (parts.scheme.lower(), parts.hostname.lower(), port)
+    except ValueError:
+        return None
+
+
+def url_matches(candidate_url, target_url):
+    """
+    True when candidate_url is on the same parsed origin as target_url
+    (scheme, host, and port), and, when the target names a path beyond
+    the root, the candidate path starts with that path. A string prefix
+    of a different origin never matches.
+    """
+    candidate_origin = parsed_origin(candidate_url)
+    target_origin = parsed_origin(target_url)
+    if candidate_origin is None or target_origin is None:
+        return False
+    if candidate_origin != target_origin:
+        return False
+    target_path = urlparse(target_url).path
+    if target_path and target_path != "/":
+        return urlparse(candidate_url).path.startswith(target_path)
+    return True
+
+
 def check_redirect(url, redirect_urls, timeout=5):
     """
-    Checks if the given URL redirects to any of the specified redirect URLs.
+    Checks whether the URL, or any hop in its redirect chain, lands on
+    any of the specified redirect URLs.
     :param url: The URL to check for redirection.
-    :param redirect_urls: A list of URLs to check if the URL redirects to.
+    :param redirect_urls: A list of URLs to check against.
     :param timeout: Timeout for the request in seconds.
-    :return: A list of redirect URLs that the given URL redirects to.
+    :return: A (matches, error) pair. matches is a list of
+             (target_url, hop_url) pairs, one per matched target, for
+             the first hop that matched it. error is a string when the
+             request itself failed, in which case no verdict was earned.
     """
     try:
         response = requests.get(url, allow_redirects=True, timeout=timeout)
-        response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
-
-        redirected_url = response.url
-        matches = []
-
-        for target_url in redirect_urls:
-            if redirected_url.startswith(target_url):
-                matches.append(target_url)
-                logging.warning(f"Potential open redirect found: {url} redirects to {target_url}")
-
-        return matches
-
     except requests.exceptions.RequestException as e:
         logging.error(f"Error during request: {e}")
-        return []
+        return [], str(e)
     except Exception as e:
         logging.error(f"An unexpected error occurred: {e}")
-        return []
+        return [], str(e)
+
+    # Every hop is evidence: each history entry's Location target, plus
+    # the final URL. An error status at the end of the chain does not
+    # discard the chain, so raise_for_status is never called here.
+    hop_urls = []
+    for past in response.history:
+        location = past.headers.get("Location")
+        if location:
+            hop_urls.append(urljoin(past.url, location))
+    hop_urls.append(response.url)
+
+    matches = []
+    matched_targets = set()
+    for hop_url in hop_urls:
+        for target_url in redirect_urls:
+            if target_url in matched_targets:
+                continue
+            if url_matches(hop_url, target_url):
+                matches.append((target_url, hop_url))
+                matched_targets.add(target_url)
+                logging.warning(f"Potential open redirect found: {url} redirects through {hop_url} matching {target_url}")
+
+    return matches, None
 
 
 def setup_argparse():
@@ -78,26 +127,30 @@ def main():
     # Input validation
     if not is_valid_url(url):
         logging.error("Invalid URL provided.")
-        return
+        sys.exit(1)
 
     for redirect_url in redirect_urls:
         if not is_valid_url(redirect_url):
             logging.error(f"Invalid redirect URL provided: {redirect_url}")
-            return
+            sys.exit(1)
 
     if timeout <= 0:
         logging.error("Timeout value must be greater than 0.")
-        return
+        sys.exit(1)
 
     logging.info(f"Checking {url} for open redirect to: {redirect_urls}")
 
     # Check for open redirect vulnerability
-    matches = check_redirect(url, redirect_urls, timeout)
+    matches, error = check_redirect(url, redirect_urls, timeout)
+
+    if error is not None:
+        print(f"Check failed for URL: {url}. The target could not be reached, so no verdict was earned.")
+        sys.exit(1)
 
     if matches:
         print(f"Potential open redirect vulnerability found for URL: {url}")
-        for match in matches:
-            print(f"  Redirects to: {match}")
+        for target_url, hop_url in matches:
+            print(f"  Redirects to: {target_url} (hop: {hop_url})")
     else:
         print(f"No open redirect vulnerability found for URL: {url}")
 
