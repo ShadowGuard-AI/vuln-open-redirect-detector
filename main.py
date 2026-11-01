@@ -28,6 +28,9 @@ def parsed_origin(url):
         if not parts.scheme or not parts.hostname:
             return None
         port = parts.port
+        # A missing port is filled with the scheme default, so a target
+        # written as http://host and a hop that lands on http://host:80
+        # count as the same origin here.
         if port is None:
             port = 443 if parts.scheme == "https" else 80
         return (parts.scheme.lower(), parts.hostname.lower(), port)
@@ -50,6 +53,9 @@ def url_matches(candidate_url, target_url):
         return False
     target_path = urlparse(target_url).path
     if target_path and target_path != "/":
+        # Plain prefix, not a path segment match. A target path of /app
+        # also matches a candidate at /apple, so keep target paths long
+        # enough to mean something.
         return urlparse(candidate_url).path.startswith(target_path)
     return True
 
@@ -83,9 +89,14 @@ def check_redirect(url, redirect_urls, timeout=5):
         location = past.headers.get("Location")
         if location:
             hop_urls.append(urljoin(past.url, location))
+    # The final URL is appended even when there was no redirect at all.
+    # Checking a page that simply lives on one of the target origins
+    # therefore reports a match with itself as the only hop.
     hop_urls.append(response.url)
 
     matches = []
+    # One entry per target, at its first matching hop. A chain that passes
+    # through the same target origin twice is reported once.
     matched_targets = set()
     for hop_url in hop_urls:
         for target_url in redirect_urls:
